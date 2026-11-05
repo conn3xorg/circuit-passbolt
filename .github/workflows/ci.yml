@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Conn3x
+        env: &gh
+          GH_TOKEN: ${{ github.token }}
+        run: &install |
+          tag=$(gh release view -R conn3xorg/conn3x --json tagName -q .tagName)
+          file="conn3x_${tag#v}_linux_amd64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/$file"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/checksums.txt"
+          grep " $file\$" checksums.txt | sha256sum -c -
+          mkdir -p bin && tar -xzf "$file" -C bin conn3x
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: conn3x version
+      - run: conn3x fmt -check -recursive
+      - name: Validate
+        run: conn3x init -backend=false && conn3x validate
+      - name: Validate the example
+        working-directory: examples/local
+        run: conn3x init -backend=false && conn3x validate
+
+  e2e:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [rocky10, fedora45, ubuntu2404, debian13]
+    name: e2e (${{ matrix.distro }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The test host images live in the Conn3x repo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: conn3xorg/conn3x
+          ref: main
+          path: conn3x
+          persist-credentials: false
+          sparse-checkout: test/images
+      - name: Install Conn3x
+        env: *gh
+        run: *install
+      - name: Start the ${{ matrix.distro }} host
+        working-directory: examples/local
+        env:
+          CONTAINERFILE: ${{ github.workspace }}/conn3x/test/images/${{ matrix.distro }}/Containerfile
+          # Podman in the host container needs a rootful, privileged container.
+          PODMAN: sudo podman
+        run: ./up.sh
+      # The release before the pinned one, so the next step is a real upgrade.
+      - name: Apply the previous release
+        working-directory: examples/local
+        env:
+          TF_VAR_passbolt_version: 5.16.0-1-ce-non-root
+          TF_VAR_image_digest: sha256:895e04c9206a69f494ce2eb747bf9a3e6ddd74c6660611d71471fb7d91637a40
+        run: |
+          conn3x init
+          conn3x apply -auto-approve
+      - name: Check Passbolt on the previous release
+        working-directory: examples/local
+        run: ./check.sh
+      - name: Upgrade to the pinned release, then plan again with no changes
+        working-directory: examples/local
+        run: |
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+      # Through an SSH tunnel to 127.0.0.1:8080: accepts the admin's invitation
+      # with a new OpenPGP key (on the first run), checks it can't be used
+      # twice, signs in over Passbolt's GPG challenge, reads the admin's
+      # profile with the token, and checks another key's challenge is refused.
+      - name: Check Passbolt on the pinned release
+        working-directory: examples/local
+        run: ./check.sh
+      # The database passwords and the invitation token are made on the host.
+      - name: Check the generated secrets stay out of state
+        working-directory: examples/local
+        run: |
+          secrets=$(sudo podman exec circuit-passbolt sh -c 'cut -d= -f2 /etc/passbolt/db.env; grep -o "/setup/start/[^ ]*" /etc/passbolt/admin-invite.txt | cut -d/ -f5')
+          [ "$(echo "$secrets" | wc -l)" = 3 ]
+          for s in $secrets; do
+            if grep -rqF --exclude-dir=modules -e "$s" terraform.tfstate .terraform/; then
+              echo "A secret is in terraform.tfstate or under .terraform/." >&2
+              exit 1
+            fi
+          done
+      # Restarting the container boots systemd again, so this checks the
+      # services start on their own and keep their data. systemd's bus takes
+      # a moment to come back, so it waits for systemd first.
+      - name: Restart the host, then check again
+        working-directory: examples/local
+        run: |
+          sudo podman restart circuit-passbolt
+          for _ in $(seq 60); do
+            case $(sudo podman exec circuit-passbolt systemctl is-system-running 2>/dev/null) in running|degraded) break ;; esac
+            sleep 1
+          done
+          ./check.sh
+      - name: Plan again after the restart, with no changes
+        working-directory: examples/local
+        run: conn3x plan -detailed-exitcode
+      - name: Clean up
+        if: always()
+        working-directory: examples/local
+        env:
+          PODMAN: sudo podman
+        run: ./down.sh
